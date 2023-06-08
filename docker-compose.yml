@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+    ports:
+      - 5001:5001
+    volumes:
+      - ./:/app
+    depends_on:
+      - db
+
+  db:
+    image: mysql
+    ports:
+      - 3306:3306
+    environment:
+      - MYSQL_ROOT_PASSWORD=woyaozhuanqian123!
+      - MYSQL_DATABASE=gpt
+    volumes:
+      - mysql_config:/etc/mysql
+      - mysql:/var/lib/mysql
+      - ./mysql/initdb:/docker-entrypoint-initdb.d
+
+volumes:
+  mysql:
+  mysql_config:
