@@ -1,75 +1,48 @@
 # import sseclient
-# import json
 # import requests
-# from langchain.llms import OpenAI
 # from typing import List
 # import re
-# from datetime import datetime
-# from flask import jsonify, request
 from functools import wraps
 from datetime import datetime
-from flask import Flask, request, Response, jsonify, session
+from flask import Flask, request, Response, jsonify
+from flask import session
 import os
 import json
 from dotenv import load_dotenv
-# 导入orm
-from flask_sqlalchemy import SQLAlchemy
-from mypdf import createPDFIndex, search, gen_prompt
+from mypdf import search, gen_prompt, createPDFIndexFromMemory
+from flask_mail import Mail, Message
 import openai
+from sqlalchemy import asc
+from utils import calculate_md5
 
+# 导入SQLAlchemy 注意这里把实体类放在别的地方了
+from dbs import db
+from models import User, Chat, UserFile, ChatFile
 
 # 加载 .env 文件
 load_dotenv()
 openaiUrl = os.getenv("OPEN_AI_URL")
-apiKey = os.getenv("API_KEY")
-
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 app = Flask(__name__)
 
-# 容器化后改成对应的host
-connector = 'mysql+mysqlconnector://root:woyaozhuanqian123!@db/gpt'
-app.config['SQLALCHEMY_DATABASE_URI'] = connector
+
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('MYSQL_URL')
 # Set the secret key to some random bytes. Keep this really secret!
 app.secret_key = b'_5#y2L"F4Q8z\n\xec]/'
 # 是否显示底层执行的SQL语句
 app.config['SQLALCHEMY_ECHO'] = True
 
+# 配置邮箱
+mail = Mail()
+app.config['MAIL_SERVER'] = 'smtp.163.com'
+app.config['MAIL_PORT'] = 25
+app.config['MAIL_USERNAME'] = '15889666941@163.com'
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PWD')
+mail.init_app(app)
 
-db = SQLAlchemy(app)
-# print(f'url {openaiUrl} key {apiKey}')
 
-
-class User(db.Model):
-    """
-    status枚举值 用户状态 注册 0 正常1 封禁2 删除3
-    user_role 0 普通用户, 1 管理员
-    is_delete 0 未删除 1 逻辑删除
-    Args:
-        db (_type_): _description_
-
-    Returns:
-        _type_: _description_
-    """
-    __tablename__ = 'user'
-
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(50))
-    password = db.Column(db.String(120))
-    email = db.Column(db.String(120))
-    create_time = db.Column(db.DateTime)
-    update_time = db.Column(db.DateTime)
-    status = db.Column(db.Integer)
-    user_role = db.Column(db.Integer)
-    is_delete = db.Column(db.Integer)
-
-    def __init__(self, name, password, email):
-        self.name = name
-        self.password = password
-        self.email = email
-
-    def __repr__(self):
-        return '<Students: %s %s %s>' % (self.id, self.name, self.stu_number)
-
-# gpt的增删改查
+# db = SQLAlchemy(app)
+db.init_app(app)
 
 
 def requires_admin(func):
@@ -79,7 +52,6 @@ def requires_admin(func):
     @wraps(func)
     def decorated_function(*args, **kwargs):
         # 获取用户信息或权限验证逻辑，假设使用 token 验证
-        """装饰器，用于验证用户权限"""
         data = request.get_json()
         id = data.get('admin_id')
         if not id:
@@ -96,10 +68,24 @@ def requires_admin(func):
     return decorated_function
 
 
+def requires_login(func):
+    """
+        接口做鉴权
+    """
+    @wraps(func)
+    def decorated_function(*args, **kwargs):
+        # 获取用户信息或权限验证逻辑，假设使用 token 验证
+        if 'userid' not in session:
+            return jsonify({'message': '该接口需要登录'}), 401
+        # 如果权限验证通过，则执行被装饰的函数
+        return func(*args, **kwargs)
+
+    return decorated_function
+
+
 @app.route('/api/users/add', methods=['POST'])
 @requires_admin
 def create_user():
-    """添加用户"""
     """
         add 创建用户
     """
@@ -128,7 +114,7 @@ def create_user():
     return jsonify({'message': 'User created successfully.'}), 201
 
 
-@app.route('/api/users/get/', methods=['POST'])
+@app.route('/api/users/get', methods=['POST'])
 @requires_admin
 def get_user():
     """
@@ -176,7 +162,7 @@ def get_user():
         return response
 
 
-@app.route('/api/users/update/', methods=['POST'])
+@app.route('/api/users/update', methods=['POST'])
 @requires_admin
 def update_user():
     """
@@ -236,6 +222,9 @@ def valid_login(name, password):
     users = User.query.filter(
         User.password == password, User.name == name).all()
     if (len(users) > 0):
+        session['username'] = users[0].name
+        session['userid'] = users[0].id
+        # print('登录: ', session['username'], session['userid'])
         return True
     else:
         return False
@@ -249,7 +238,6 @@ def login():
         username = data.get('name')
         password = data.get('password')
         if valid_login(username, password):
-            session['username'] = username
             return jsonify({'success': True}), 200
         else:
             error = 'Invalid username or password'
@@ -260,6 +248,7 @@ def login():
 def logout():
     if 'username' in session:
         session.pop('username', None)
+        session.pop('userid', None)
         return {'data': "logout successfully!"}
     else:
         return {'data': "you have already logged out"}
@@ -267,6 +256,7 @@ def logout():
 
 @app.route("/api/status")
 def home():
+    """判断是否登录"""
     if 'username' in session:
         return {
             "data": f'Logged in as {session["username"]}',
@@ -278,9 +268,55 @@ def home():
         "code": 0
     }
 
+# 发送邮件
+# 1.发送文本
 
-def stream_output(input_text):
 
+@app.route('/api/mail/subscribe', methods=['post'])
+def email_send_charactor():
+    """
+    subject 为邮件标题
+    recipients 为接收邮件账号
+    body 为邮箱内容
+    :return:
+    """
+
+    data = request.get_json()
+    email_interest = data.get('email')
+    body_message = f'ChatRepos客户营销 : 邮件地址是{email_interest}的用户希望咨询该产品, 请尽快联系谢谢!'
+    message = Message(subject='【ChatRepos客户营销】',
+                      sender=app.config['MAIL_USERNAME'],
+                      recipients=['caijy18@tsinghua.org.cn'],
+                      body=body_message)
+    try:
+        mail.send(message)
+        return {
+            "data": "'邮件发送成功，请注意查看!'",
+            "code": 0
+        }, 200
+
+    except Exception as e:
+        print(e)
+        return {
+            "data": '邮件发送失败',
+            "code": 0
+        }, 400
+
+
+@app.route('/api/chat/history', methods=['GET'])
+@requires_login
+def get_chat_history():
+    chats = Chat.query.filter(
+        Chat.userid == session['userid'], Chat.is_delete == 0)\
+        .order_by(asc(Chat.update_time))
+    # 将查询结果转换为 JSON 格式
+    result = [chat.serialize() for chat in chats]
+    return jsonify(result)
+
+
+def stream_output(input_text, userid):
+    # 插入上下文
+    app.app_context().push()
     response = openai.ChatCompletion.create(
         model='gpt-3.5-turbo',
         messages=[
@@ -289,41 +325,106 @@ def stream_output(input_text):
         temperature=0,
         stream=True  # this time, we set stream=True
     )
+    question = Chat(
+        userid=userid, type=0, content=input_text)
+    db.session.add(question)
+    answer = ''
     for line in response:
         if 'content' in line['choices'][0]['delta']:
             # print(line['choices'][0]['delta']['content'])
-            yield ('data: {}\n\n'.format(json.dumps(line['choices'][0]['delta']['content'])))
+            text = line['choices'][0]['delta']['content']
+            answer += text
+            yield ('data: {}\n\n'.format(json.dumps(text)))
+        elif 'finish_reason' in line['choices'][0] and len(line['choices'][0]['delta']) == 0:
+            # 回答完毕,把回答落库
+            response = Chat(
+                userid=userid, type=1, content=answer)
+            db.session.add(response)
+            db.session.commit()
 
 
-@app.route('/api/stream', methods=['POST'])
+@app.route('/api/chat/stream', methods=['POST'])
 def completion_api():
     # a ChatCompletion request
     req_data = request.get_json()
-    input_text = req_data["messages"][0]["content"]
-    return Response(stream_output(input_text), mimetype='text/event-stream')
+    input_text = req_data["messages"]
+    return Response(stream_output(input_text, session['userid']), mimetype='text/event-stream')
 
 
-@app.route('/upload', methods=['POST'])
+@app.route('/api/files/list', methods=['GET'])
+@requires_login
+def get_file_list():
+    userid = session["userid"]
+    files = UserFile.query.filter(
+        UserFile.userid == userid, UserFile.is_delete == 0).all()
+    # 将查询结果转换为 JSON 格式
+    result = [file.serialize() for file in files]
+    return jsonify(result)
+
+
+@app.route('/api/files/upload', methods=['POST'])
+@requires_login
 def upload():
     file = request.files['file']
     # 处理上传的文件
-    print(file)
     username = session["username"]
+    userid = session["userid"]
+    file_md5 = calculate_md5(file)  # 计算文件md5
+
+    # 判断是否上传过,如果上传过则不处理
+    user_file = UserFile.query.filter(UserFile.userid == userid,
+                                      UserFile.file_md5 == file_md5,
+                                      UserFile.is_delete == 0).first()
+
+    if not user_file:
+        # 已经上传过
+        newUserFile = UserFile(userid=userid, file_type=0,
+                               file_name=file.filename,
+                               file_md5=file_md5)
+
+        # createPDFIndex(username=username, filename=file.filename)
+        try:
+            createPDFIndexFromMemory(
+                username=username, filename=file.filename, file=file)
+        except Exception as e:
+            print(e)
+            return {
+                'status': 'fail',
+                "code": 0
+            }, 400
+        db.session.add(newUserFile)
+        db.session.commit()
+        # 传字典就自动转化成json
+        return {
+            'name': f'{file.filename}',
+            'fileid': newUserFile.id,
+            'status': 'success'
+        }, 201
+    else:
+        user_files = UserFile.query.filter(UserFile.userid == userid,
+                                           UserFile.file_md5 == file_md5,
+                                           UserFile.is_delete == 0).all()
+        if len(user_files) > 1:
+            return {
+                'name': f'{file.filename}',
+                'fileid': user_file.id,
+                'status': 'fail',
+                'desc': '上传文件存在多个重复值,请联系管理员操作'
+            }, 400
+        return {
+            'name': f'{file.filename}',
+            'fileid': user_file.id,
+            'status': 'success'
+        }, 201
 
     # 保存文件到磁盘
-    save_path = '/Users/liangjiongxin/chatgpt/langchain/web/files/'  # 文件保存路径
-    if not os.path.exists(save_path):  # 如果路径不存在则创建
-        os.makedirs(save_path)
+    # save_path = '/Users/liangjiongxin/chatgpt/langchain/web/files/'   # 文件保存路径
+    # if not os.path.exists(save_path):  # 如果路径不存在则创建
+    #     os.makedirs(save_path)
 
-    if not (os.path.exists(os.path.join(save_path, file.filename))):
-        file.save(os.path.join(save_path, file.filename))
-        createPDFIndex(username=username, filename=file.filename)
-
-    # 传字典就自动转化成json
-    return {
-        'name': f'{file.filename}',
-        'status': 'success'
-    }
+    # if not (os.path.exists(os.path.join(save_path, file.filename))):
+    #     file.save(os.path.join(save_path, file.filename))
+    #     createPDFIndex(username=username, filename=file.filename)
 
 
 @app.route('/api/pdf/ask', methods=['POST'])
@@ -331,12 +432,27 @@ def askpdf():
     data = request.get_json()
     query = data.get('query')
     filename = data.get('filename')
+    fileid = data.get('fileid')
+
     username = session["username"]
+    userid = session["userid"]
     docs = search(query, filename, username)
     prompt = gen_prompt(docs, query)
     sources = sorted(set([doc.metadata['page_number'] for doc in docs]))
 
+    # 根据用户传过来的fileid，获取对应的pdf文件
+    # user_file = UserFile.query.filter(UserFile.userid == userid,
+    #                                   UserFile.id == fileid).first()
+
+    # 落库问题
+    userMessage = ChatFile(userid=userid, fileid=fileid,
+                           type=0, content=query)
+    db.session.add(userMessage)
+    db.session.commit()
+
     def gen_answer(docs, query):
+        # 插入上下文
+        app.app_context().push()
         completion = openai.ChatCompletion.create(model="gpt-3.5-turbo",
                                                   messages=[
                                                       {"role": "system",
@@ -344,13 +460,26 @@ def askpdf():
                                                       {"role": "user",
                                                           "content": f"{prompt}"},
                                                   ], stream=True, max_tokens=500, temperature=0)
+        answer = ''
         for line in completion:
             if 'content' in line['choices'][0]['delta']:
-                yield ('data: {}\n\n'.format(json.dumps(line['choices'][0]['delta']['content'])))
+                text = line['choices'][0]['delta']['content']
+                answer += text
+                yield ('data: {}\n\n'.format(json.dumps(text)))
+
+        answer += "数据来源: "
         yield "data: {}\n\n".format(json.dumps("数据来源: "))
         for page in sources:
             page_data = "第{}页 ".format(page)
+            answer += page_data
             yield ('data: {} \n\n'.format(json.dumps(page_data)))
+
+        # 落库
+        aiMessage = ChatFile(userid=userid, fileid=fileid,
+                             type=1, content=answer)
+        db.session.add(aiMessage)
+        db.session.commit()
+
     # res_headers = {
     #     'Content-Type': 'text/event-stream',
     #     'Cache-Control': 'no-cache',
@@ -359,5 +488,26 @@ def askpdf():
     return Response(gen_answer(docs, query),   mimetype='text/event-stream')
 
 
+@app.route('/api/pdf/history', methods=['POST'])
+@requires_login
+def get_chat_file_history():
+    data = request.get_json()
+    fileid = data.get('fileid')
+    chats = ChatFile.query.filter(
+        ChatFile.userid == session['userid'], ChatFile.fileid == fileid)\
+        .order_by(asc(ChatFile.update_time))
+    # 将查询结果转换为 JSON 格式
+    result = [chat.serialize() for chat in chats]
+    return jsonify(result)
+
+
+@app.route('/api/hello', methods=['GET'])
+def test_connection():
+    return jsonify({"data": "hello world"}), 200
+
+
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=6000)
+
+
+# 之前的流式实现接口
