@@ -12,6 +12,8 @@ pip install chromadb
 # 更新
 pip install pymupdf
 pip install tiktoken
+
+pip install flask-cors
 ```
 
 支持发送邮件

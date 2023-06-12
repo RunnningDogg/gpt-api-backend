@@ -6,6 +6,7 @@ from functools import wraps
 from datetime import datetime
 from flask import Flask, request, Response, jsonify
 from flask import session
+from flask_cors import CORS
 import os
 import json
 from dotenv import load_dotenv
@@ -21,10 +22,14 @@ from models import User, Chat, UserFile, ChatFile
 
 # 加载 .env 文件
 load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 openaiUrl = os.getenv("OPEN_AI_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+print("load api key")
 app = Flask(__name__)
 
+# 跨域请求
+CORS(app)  # 全局配置CORS
 
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('MYSQL_URL')
 # Set the secret key to some random bytes. Keep this really secret!
